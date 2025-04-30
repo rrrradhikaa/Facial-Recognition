@@ -5,13 +5,11 @@ This is a Python-based facial authentication system with encryption and liveness
 ---
 
 ## Features
-
-- Face-based user registration and login  
-- Liveness detection using Eye Aspect Ratio (to avoid spoofing)  
-- Secure storage of facial data using Fernet encryption  
-- SQLite3 database integration  
-- Access logs with IP address and timestamp  
-- Uses Dlib, OpenCV, and Face Recognition libraries  
+- Face-based user registration and login
+- Liveness detection using Eye Aspect Ratio (to avoid spoofing)
+- Secure storage of facial data using Fernet encryption
+- SQLite3 database integration
+- Uses Dlib, OpenCV, and Facial Recognition Libraries
 
 ---
 
