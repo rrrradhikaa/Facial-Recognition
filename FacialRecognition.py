@@ -9,6 +9,10 @@ import time
 from scipy.spatial import distance as dist
 import face_recognition
 import socket
+from skimage.feature import hog
+from sklearn.svm import SVC
+from sklearn.preprocessing import LabelEncoder
+import joblib
 
 os.makedirs("database", exist_ok=True)
 os.makedirs("encryption_key", exist_ok=True)
