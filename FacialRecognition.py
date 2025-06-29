@@ -1,3 +1,5 @@
+# Full version of your system with hybrid (HOG + CNN) feature fusion and SVM classifier
+
 import os
 import logging
 import sqlite3
@@ -95,6 +97,17 @@ class FaceDatabase:
 
         self.conn.commit()
 
+    def save_classifier(self, clf, encoder):
+        joblib.dump(clf, "database/classifier.pkl")
+        joblib.dump(encoder, "database/label_encoder.pkl")
+
+    def load_classifier(self):
+        if os.path.exists("database/classifier.pkl") and os.path.exists("database/label_encoder.pkl"):
+            clf = joblib.load("database/classifier.pkl")
+            encoder = joblib.load("database/label_encoder.pkl")
+            return clf, encoder
+        return None, None
+
 class FaceProcessor:
     def __init__(self):
         self.detector = dlib.get_frontal_face_detector()
@@ -144,11 +157,6 @@ class FaceProcessor:
         ear = (A + B) / (2.0 * C)
         return ear
 
-    def extract_encodings(self, face_image):
-        rgb_image = cv.cvtColor(face_image, cv.COLOR_BGR2RGB)
-        encodings = face_recognition.face_encodings(rgb_image)
-        return encodings[0] if encodings else None
-
 class FaceAuthSystem:
     def __init__(self):
         self.face_db = FaceDatabase()
@@ -156,6 +164,7 @@ class FaceAuthSystem:
         self.known_encodings = []
         self.known_names = []
         self.known_user_ids = []
+        self.name_to_user_id = {}
         self._load_known_faces()
 
     def _load_known_faces(self):
@@ -163,6 +172,28 @@ class FaceAuthSystem:
         self.known_encodings = [enc for _, _, enc in records]
         self.known_names = [name for _, name, _ in records]
         self.known_user_ids = [user_id for user_id, _, _ in records]
+        self.name_to_user_id = {name: user_id for user_id, name, _ in records}
+
+    def extract_hybrid_features(self, image):
+        rgb_image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+        face_encodings = face_recognition.face_encodings(rgb_image)
+        if not face_encodings:
+            return None
+        deep_feat = face_encodings[0]
+
+        gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+        resized = cv.resize(gray,(128,128))
+
+        if resized.dtype != np.uint8:
+            resized = np.clip(resized, 0, 255).astype(np.uint8)
+
+        try:
+            hog_feat = hog(resized, pixels_per_cell = (8,8), cells_per_block = (2,2), feature_vector = True)
+        except Exception as e:
+            logging.error(f"HOG feature extraction failed: {e}")
+            return None
+
+        return np.concatenate((deep_feat, hog_feat))
 
     def register_user(self):
         print("\n=== User Registration ===")
@@ -175,16 +206,34 @@ class FaceAuthSystem:
             print("Failed to capture a valid face image.")
             return
 
-        encoding = self.face_processor.extract_encodings(face_image)
-        if encoding is None:
+        features = self.extract_hybrid_features(face_image)
+        if features is None:
             print("No face detected in the image.")
             return
 
-        if self.face_db.add_user(name, user_id, encoding):
+        if self.face_db.add_user(name, user_id, features):
             print("Registration Successful!!")
             self._load_known_faces()
+            self.train_classifier()
         else:
             print("Registration failed")
+
+    def train_classifier(self):
+        records = self.face_db.get_all_encodings()
+        X = [enc for _, _, enc in records]
+        y = [name for _, name, _ in records]
+
+        if len(set(y)) < 2:
+            print("At least two users are required to train the classifier.")
+            logging.warning("Classifier training skipped: only one class available.")
+            return
+
+        encoder = LabelEncoder()
+        y_encoded = encoder.fit_transform(y)
+        clf = SVC(kernel = "linear", probability = True)
+        clf.fit(X, y_encoded)
+        self.face_db.save_classifier(clf, encoder)
+        print("Classifier trained successfully.")
 
     def authentication(self):
         print("\n === Authentication ===")
@@ -194,26 +243,27 @@ class FaceAuthSystem:
             print("Liveness check failed.")
             return
 
-        encoding = self.face_processor.extract_encodings(face_image)
-        if encoding is None:
+        features = self.extract_hybrid_features(face_image)
+        if features is None:
             print("No face detected.")
             return
 
-        matches = face_recognition.compare_faces(self.known_encodings, encoding, tolerance=0.5)
+        clf, encoder = self.face_db.load_classifier()
+        if clf is None:
+            print("Classifier is not trained yet.")
+            return
+
+        prediction = clf.predict([features])
+        name = encoder.inverse_transform(prediction)[0]
         ip_address = socket.gethostbyname(socket.gethostname())
+        print(f"Welcome {name}")
 
-        
-
-        if True in matches:
-            match_idx = matches.index(True)
-            name = self.known_names[match_idx]
-            user_id = self.known_user_ids[match_idx]
-            print(f"Welcome {name}")
+        user_id = self.name_to_user_id.get(name)
+        if user_id:
             self.face_db.log_access(user_id, True, ip_address)
-
         else:
-            print("Authentication failed.")
-            self.face_db.log_access(None, False, ip_address)
+            print("User ID not found for authenticated name.")
+            logging.warning(f"No matching user ID for name: {name}")
 
 if __name__ == '__main__':
     system = FaceAuthSystem()
