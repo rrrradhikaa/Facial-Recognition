@@ -1,5 +1,3 @@
-# Full version of your system with hybrid (HOG + CNN) feature fusion and SVM classifier
-
 import os
 import logging
 import sqlite3
