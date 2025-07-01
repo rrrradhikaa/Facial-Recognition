@@ -13,6 +13,10 @@ from skimage.feature import hog
 from sklearn.svm import SVC
 from sklearn.preprocessing import LabelEncoder
 import joblib
+from fer import FER
+from sklearn.linear_model import LinearRegression
+import matplotlib.pyplot as plt
+from collections import Counter
 
 os.makedirs("database", exist_ok=True)
 os.makedirs("encryption_key", exist_ok=True)
@@ -130,6 +134,19 @@ class FaceProcessor:
 
         cap.release()
         return None
+    
+    def capture_frames_over_time(self, duration_sec = 60):
+        cap = cv.VideoCapture(0)
+        frames = []
+        start = time.time()
+
+        while time.time() - start < duration_sec:
+            ret, frame = cap.read()
+            if ret:
+                frames.append(frame)
+            time.sleep(1)
+        cap.release()
+        return frames
 
     def check_liveness(self, frame, face):
         landmarks = self.predictor(cv.cvtColor(frame, cv.COLOR_BGR2GRAY), face)
@@ -154,6 +171,44 @@ class FaceProcessor:
 
         ear = (A + B) / (2.0 * C)
         return ear
+
+class SentimentAnalyzer:
+    
+    def __init__(self):
+        self.detector = FER(mtcnn = True)
+    
+    def analyze_emotion_trend(self, frames):
+        emotions = []
+        for frame in frames:
+            result = self.detector.top_emotion(frame)
+            if result:
+                emotions.append(result[0])
+
+        if not emotions:
+            print("No emotions detected.")
+            return
+
+        counter = Counter(emotions)
+        total = sum(counter.values())
+        percentages = {emo: round((count/total*100), 2) for emo, count in counter.items()}
+
+        self._plot_emotions(percentages)
+        self._regression(emotions)
+
+    def _regression(self, emotions):
+        x = np.arange(len(emotions)).reshape(-1, 1)
+        for emotion_type in emotions:
+            y = np.array([1 if emo == emotion_type else 0 for emo in emotions])
+            model = LinearRegression().fit(x,y)
+            print(f"Emotion: {emotion_type}, w1: {model.coef_[0]:.6f}, w0: {model.intercept_:.6f}")
+
+    def _plot_emotions(self, percentages):
+        plt.bar(percentages.keys(), percentages.values())
+        plt.title("Emotion distribution over time")
+        plt.ylabel("Percentage (%)")
+        plt.xticks(rotation = 45)
+        plt.tight_layout()
+        plt.show()
 
 class FaceAuthSystem:
     def __init__(self):
@@ -265,12 +320,15 @@ class FaceAuthSystem:
 
 if __name__ == '__main__':
     system = FaceAuthSystem()
+    sentiment = SentimentAnalyzer()
 
     while True:
         print("\n Main Menu: ")
         print("1. Register New User")
         print("2. Authenticate User")
-        print("3. Exit Program")
+        print("3. Analyze Emotions Over Time")
+        print("4.Exit")
+
 
         choice = input("Select Option: ")
 
@@ -280,6 +338,10 @@ if __name__ == '__main__':
             elif choice == "2":
                 system.authentication()
             elif choice == "3":
+                print("Capturing 60 seconds of emotional data....")
+                frames = system.face_processor.capture_frames_over_time(60)
+                sentiment.analyze_emotion_trend(frames)
+            elif choice == "4":
                 break
             else:
                 print("Invalid Choice.")
