@@ -4,3 +4,10 @@ dlib
 cryptography
 numpy
 scipy
+sqlite3
+socket
+skimage
+sklearn
+joblib
+fer
+matplotlib
