@@ -53,6 +53,12 @@ class FaceDatabase:
                        success BOOLEAN,
                        ip_address TEXT) ''')
 
+        # Safe schema update for emotion column
+        cursor.execute("PRAGMA table_info(access_logs)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if 'emotion' not in columns:
+            cursor.execute('''ALTER TABLE access_logs ADD COLUMN emotion TEXT''')
+
         self.conn.commit()
 
     def _init_encryption(self):
@@ -92,11 +98,10 @@ class FaceDatabase:
         return [(row[0], row[1], np.frombuffer(self.cipher.decrypt(row[2]), dtype=np.float64))
                 for row in cursor.fetchall()]
 
-    def log_access(self, user_id, success, ip_address):
+    def log_access(self, user_id, success, ip_address, emotion="unknown"):
         cursor = self.conn.cursor()
-        cursor.execute('''INSERT INTO access_logs (user_id, success, ip_address) VALUES (?, ?, ?)''',
-                       (user_id, success, ip_address))
-
+        cursor.execute('''INSERT INTO access_logs (user_id, success, ip_address, emotion) VALUES (?, ?, ?, ?)''',
+                       (user_id, success, ip_address, emotion))
         self.conn.commit()
 
     def save_classifier(self, clf, encoder):
@@ -109,6 +114,7 @@ class FaceDatabase:
             encoder = joblib.load("database/label_encoder.pkl")
             return clf, encoder
         return None, None
+
 
 class FaceProcessor:
     def __init__(self):
@@ -134,8 +140,8 @@ class FaceProcessor:
 
         cap.release()
         return None
-    
-    def capture_frames_over_time(self, duration_sec = 60):
+
+    def capture_frames_over_time(self, duration_sec=60):
         cap = cv.VideoCapture(0)
         frames = []
         start = time.time()
@@ -150,7 +156,6 @@ class FaceProcessor:
 
     def check_liveness(self, frame, face):
         landmarks = self.predictor(cv.cvtColor(frame, cv.COLOR_BGR2GRAY), face)
-
         left_eye = self._get_eye_points(landmarks, "left")
         right_eye = self._get_eye_points(landmarks, "right")
 
@@ -168,15 +173,13 @@ class FaceProcessor:
         A = dist.euclidean(eye_points[1], eye_points[5])
         B = dist.euclidean(eye_points[2], eye_points[4])
         C = dist.euclidean(eye_points[0], eye_points[3])
+        return (A + B) / (2.0 * C)
 
-        ear = (A + B) / (2.0 * C)
-        return ear
 
 class SentimentAnalyzer:
-    
     def __init__(self):
-        self.detector = FER(mtcnn = True)
-    
+        self.detector = FER(mtcnn=True)
+
     def analyze_emotion_trend(self, frames):
         emotions = []
         for frame in frames:
@@ -190,30 +193,39 @@ class SentimentAnalyzer:
 
         counter = Counter(emotions)
         total = sum(counter.values())
-        percentages = {emo: round((count/total*100), 2) for emo, count in counter.items()}
+        percentages = {emo: round((count / total * 100), 2) for emo, count in counter.items()}
 
         self._plot_emotions(percentages)
         self._regression(emotions)
 
     def _regression(self, emotions):
+        if not emotions:
+            print("No emotions available for regression.")
+            return
+        
+        print("\n=== Linear Regression Results ===")
         x = np.arange(len(emotions)).reshape(-1, 1)
-        for emotion_type in emotions:
+        for emotion_type in set(emotions):
             y = np.array([1 if emo == emotion_type else 0 for emo in emotions])
-            model = LinearRegression().fit(x,y)
-            print(f"Emotion: {emotion_type}, w1: {model.coef_[0]:.6f}, w0: {model.intercept_:.6f}")
+            model = LinearRegression().fit(x, y)
+            print(f"Emotion: {emotion_type:8s} | w1: {model.coef_[0]:.6f}, w0: {model.intercept_:.6f}")
+        print("=================================")
+        input("Press Enter to continue...")
 
     def _plot_emotions(self, percentages):
         plt.bar(percentages.keys(), percentages.values())
         plt.title("Emotion distribution over time")
         plt.ylabel("Percentage (%)")
-        plt.xticks(rotation = 45)
+        plt.xticks(rotation=45)
         plt.tight_layout()
         plt.show()
+
 
 class FaceAuthSystem:
     def __init__(self):
         self.face_db = FaceDatabase()
         self.face_processor = FaceProcessor()
+        self.sentiment = SentimentAnalyzer()
         self.known_encodings = []
         self.known_names = []
         self.known_user_ids = []
@@ -235,13 +247,11 @@ class FaceAuthSystem:
         deep_feat = face_encodings[0]
 
         gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
-        resized = cv.resize(gray,(128,128))
-
-        if resized.dtype != np.uint8:
-            resized = np.clip(resized, 0, 255).astype(np.uint8)
+        resized = cv.resize(gray, (128, 128))
+        resized = np.clip(resized, 0, 255).astype(np.uint8)
 
         try:
-            hog_feat = hog(resized, pixels_per_cell = (8,8), cells_per_block = (2,2), feature_vector = True)
+            hog_feat = hog(resized, pixels_per_cell=(8, 8), cells_per_block=(2, 2), feature_vector=True)
         except Exception as e:
             logging.error(f"HOG feature extraction failed: {e}")
             return None
@@ -283,7 +293,7 @@ class FaceAuthSystem:
 
         encoder = LabelEncoder()
         y_encoded = encoder.fit_transform(y)
-        clf = SVC(kernel = "linear", probability = True)
+        clf = SVC(kernel="linear", probability=True)
         clf.fit(X, y_encoded)
         self.face_db.save_classifier(clf, encoder)
         print("Classifier trained successfully.")
@@ -309,26 +319,41 @@ class FaceAuthSystem:
         prediction = clf.predict([features])
         name = encoder.inverse_transform(prediction)[0]
         ip_address = socket.gethostbyname(socket.gethostname())
-        print(f"Welcome {name}")
 
+        emotion_result = self.sentiment.detector.top_emotion(face_image)
+        emotion = emotion_result[0] if emotion_result else "unknown"
+        print(f"Detected emotion: {emotion}")
+
+        if emotion in ["angry", "fear", "disgust"]:
+            print("High stress detected. Secondary authentication required.")
+            otp = input("Enter OTP sent to your email.")
+            if otp != "123456":
+                print("Authentication failed.")
+                self.face_db.log_access(
+                    user_id=self.name_to_user_id.get(name),
+                    success=False,
+                    ip_address=ip_address,
+                    emotion=emotion
+                )
+                return
+
+        print(f"Welcome {name}")
         user_id = self.name_to_user_id.get(name)
         if user_id:
-            self.face_db.log_access(user_id, True, ip_address)
+            self.face_db.log_access(user_id, True, ip_address, emotion)
         else:
             print("User ID not found for authenticated name.")
             logging.warning(f"No matching user ID for name: {name}")
 
 if __name__ == '__main__':
     system = FaceAuthSystem()
-    sentiment = SentimentAnalyzer()
 
     while True:
         print("\n Main Menu: ")
         print("1. Register New User")
         print("2. Authenticate User")
         print("3. Analyze Emotions Over Time")
-        print("4.Exit")
-
+        print("4. Exit")
 
         choice = input("Select Option: ")
 
@@ -340,7 +365,7 @@ if __name__ == '__main__':
             elif choice == "3":
                 print("Capturing 60 seconds of emotional data....")
                 frames = system.face_processor.capture_frames_over_time(60)
-                sentiment.analyze_emotion_trend(frames)
+                system.sentiment.analyze_emotion_trend(frames)
             elif choice == "4":
                 break
             else:
