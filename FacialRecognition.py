@@ -17,6 +17,9 @@ from fer import FER
 from sklearn.linear_model import LinearRegression
 import matplotlib.pyplot as plt
 from collections import Counter
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.pipeline import Pipeline
 
 # Create necessary directories
 os.makedirs("database", exist_ok=True)
@@ -128,6 +131,20 @@ class FaceDatabase:
         except Exception as e:
             logging.error(f"Error loading classifier: {e}")
         return None, None
+    
+    def save_pipeline(self, pipeline):
+        try:
+            joblib.dump(pipeline, "database/feature_pipeline.pkl")
+        except Exception as e:
+            logging.error(f"Error saving feature pipeline: {e}")
+
+    def load_pipeline(self):
+        try:
+            if os.path.exists("database/feature_pipeline.pkl"):
+                return joblib.load("databse/feature_pipeline.pkl")
+        except Exception as e:
+            logging.error(f"Error loading feature pipeline: {e}")
+        return None
 
 
 class FaceProcessor:
@@ -297,6 +314,8 @@ class FaceAuthSystem:
             self.known_user_ids = []
             self.name_to_user_id = {}
             self._load_known_faces()
+            self.feature_pipeline = None
+            self._load_feature_pipeline()
         except Exception as e:
             logging.error(f"Error initializing FaceAuthSystem: {e}")
             raise
@@ -311,6 +330,29 @@ class FaceAuthSystem:
         except Exception as e:
             logging.error(f"Error loading known faces: {e}")
 
+    def _load_feature_pipeline(self):
+        self.feature_pipeline = self.face_db.load_pipeline()
+        if self.feature_pipeline is None and self.known_encodings:
+            self._train_feature_pipeline()
+
+    def _train_feature_pipeline(self):
+        try:
+            pipeline = Pipeline([
+                ('feature_selection', SelectKBest(f_classif, k =100)),
+                ('dimensionality_reduction', PCA(n_components = 0.95))
+            ])
+
+            if len(self.known_encodings) > 1:
+                pipeline.fit(self.known_encodings, self.known_names)
+                self.feature_pipeline = pipeline
+                self.face_db.save_pipeline(pipeline)
+                logging.info("Feature reduction pipeline trained and saved.")
+            else:
+                print("Atleast 2 users are needed to train the pipeline.")
+        
+        except Exception as e:
+            logging.error(f"Error training feature pipeline: {e}")
+
     def extract_hybrid_features(self, image):
         try:
             rgb_image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
@@ -324,10 +366,43 @@ class FaceAuthSystem:
             resized = np.clip(resized, 0, 255).astype(np.uint8)
 
             hog_feat = hog(resized, pixels_per_cell=(8, 8), cells_per_block=(2, 2), feature_vector=True)
-            return np.concatenate((deep_feat, hog_feat))
+            combined_feat = np.concatenate((deep_feat, hog_feat))
+
+            if self.feature_pipeline is not None:
+                combined_feat = self.feature_pipeline.transform([combined_feat])[0]
+            
+            return combined_feat
         except Exception as e:
             logging.error(f"Error extracting hybrid features: {e}")
             return None
+        
+    def train_classifier(self):
+        try:
+            records = self.face_db.get_all_encodings()
+            if not records:
+                print("No users in database to train classifier.")
+                return
+
+            X = [enc for _, _, enc in records]
+            if self.feature_pipeline is not None:
+                X = self.feature_pipeline.transform(X)
+
+            y = [name for _, name, _ in records]
+
+            if len(set(y)) < 2:
+                print("At least two users are required to train the classifier.")
+                logging.warning("Classifier training skipped: only one class available.")
+                return
+
+            encoder = LabelEncoder()
+            y_encoded = encoder.fit_transform(y)
+            clf = SVC(kernel="linear", probability=True)
+            clf.fit(X, y_encoded)
+            self.face_db.save_classifier(clf, encoder)
+            print("Classifier trained successfully.")
+        except Exception as e:
+            logging.error(f"Error training classifier: {e}")
+            print("Classifier training failed.")
 
     def register_user(self):
         print("\n=== User Registration ===")
@@ -352,34 +427,11 @@ class FaceAuthSystem:
         if self.face_db.add_user(name, user_id, features):
             print("Registration Successful!!")
             self._load_known_faces()
+            self._train_feature_pipeline()
             self.train_classifier()
         else:
             print("Registration failed")
 
-    def train_classifier(self):
-        try:
-            records = self.face_db.get_all_encodings()
-            if not records:
-                print("No users in database to train classifier.")
-                return
-
-            X = [enc for _, _, enc in records]
-            y = [name for _, name, _ in records]
-
-            if len(set(y)) < 2:
-                print("At least two users are required to train the classifier.")
-                logging.warning("Classifier training skipped: only one class available.")
-                return
-
-            encoder = LabelEncoder()
-            y_encoded = encoder.fit_transform(y)
-            clf = SVC(kernel="linear", probability=True)
-            clf.fit(X, y_encoded)
-            self.face_db.save_classifier(clf, encoder)
-            print("Classifier trained successfully.")
-        except Exception as e:
-            logging.error(f"Error training classifier: {e}")
-            print("Classifier training failed.")
 
     def authentication(self):
         print("\n=== Authentication ===")
