@@ -20,6 +20,8 @@ from collections import Counter
 from sklearn.decomposition import PCA
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.pipeline import Pipeline
+import skfuzzy as fuzz
+from skfuzzy import control as ctrl
 
 # Create necessary directories
 os.makedirs("database", exist_ok=True)
@@ -97,7 +99,9 @@ class FaceDatabase:
             cursor = self.conn.cursor()
             cursor.execute('''SELECT u.user_id, u.name, fe.encrypted_data
                             FROM users u
-                            JOIN face_encodings fe ON u.id = fe.user_id''')
+                            JOIN face_encodings fe ON u.id = fe.user_id
+                            ORDER BY fe.id ASC''')
+
             return [(row[0], row[1], np.frombuffer(self.cipher.decrypt(row[2]), dtype=np.float64))
                     for row in cursor.fetchall()]
         except sqlite3.Error as e:
@@ -107,10 +111,15 @@ class FaceDatabase:
     def log_access(self, user_id, success, ip_address, emotion="unknown"):
         try:
             cursor = self.conn.cursor()
-            cursor.execute('''INSERT INTO access_logs 
-                           (user_id, success, ip_address, emotion) 
-                           VALUES (?, ?, ?, ?)''',
-                         (user_id, success, ip_address, emotion))
+            if user_id is None:
+                cursor.execute('''INSERT INTO access_logs (user_id, success, ip_address, emotion)
+                                VALUES (NULL, ?, ?, ?)''',
+                            (success, ip_address, emotion))
+            else:
+                cursor.execute('''INSERT INTO access_logs 
+                            (user_id, success, ip_address, emotion) 
+                            VALUES (?, ?, ?, ?)''',
+                            (user_id, success, ip_address, emotion))
             self.conn.commit()
         except sqlite3.Error as e:
             logging.error(f"Database Error in log_access: {e}")
@@ -302,6 +311,84 @@ class SentimentAnalyzer:
         except Exception as e:
             logging.error(f"Error plotting emotions: {e}")
 
+class IntervalType2FIS:
+    def __init__(self):
+        self.face_match = ctrl.Antecedent(np.arange(0, 1.01, 0.1), "face_match")
+        self.emotion_stability = ctrl.Antecedent(np.arange(0, 1.01, 0.1), "emotion_stability")
+        self.liveness_score = ctrl.Antecedent(np.arange(0, 1.01, 0.1), "liveness_score")
+
+        self.auth_confidence = ctrl.Consequent(np.arange(0, 1.1, 0.1), "auth_confidence")
+
+        self._setup_membership_function()
+        self._setup_rules()
+
+    def _setup_membership_function(self):
+        self.face_match['low'] = fuzz.gaussmf(self.face_match.universe, 0.15, 0.1)
+        self.face_match['medium'] = fuzz.gaussmf(self.face_match.universe, 0.5, 0.15)
+        self.face_match['high'] = fuzz.gaussmf(self.face_match.universe, 0.85, 0.1)
+
+        self.emotion_stability['low'] = fuzz.gaussmf(self.emotion_stability.universe, 0.2, 0.1)
+        self.emotion_stability['medium'] = fuzz.gaussmf(self.emotion_stability.universe, 0.5, 0.15)
+        self.emotion_stability['high'] = fuzz.gaussmf(self.emotion_stability.universe, 0.8, 0.1)
+
+        self.liveness_score['low'] = fuzz.gaussmf(self.liveness_score.universe, 0.1, 0.08)
+        self.liveness_score['medium'] = fuzz.gaussmf(self.liveness_score.universe, 0.5, 0.15)
+        self.liveness_score['high'] = fuzz.gaussmf(self.liveness_score.universe, 0.9, 0.1)
+
+        self.auth_confidence['reject'] = fuzz.trimf(self.auth_confidence.universe, [0, 0, 0.4])
+        self.auth_confidence['review'] = fuzz.trimf(self.auth_confidence.universe, [0.3, 0.5, 0.7])
+        self.auth_confidence['accept'] = fuzz.trimf(self.auth_confidence.universe, [0.6, 1, 1])
+
+    def _setup_rules(self):
+        rules = [
+            ctrl.Rule(self.face_match['high'] & self.emotion_stability['high']
+                      & self.liveness_score['high'], self.auth_confidence['accept']),
+            
+            ctrl.Rule(self.face_match['high'] & self.emotion_stability['medium']
+                      & self.liveness_score['high'], self.auth_confidence['accept']),
+
+
+            ctrl.Rule(self.face_match['high'] & self.emotion_stability['low']
+                      & self.liveness_score['high'], self.auth_confidence['review']),
+
+            ctrl.Rule(self.face_match['medium'] & self.emotion_stability['medium']
+                      & self.liveness_score['medium'], self.auth_confidence['review']),
+
+            ctrl.Rule(self.face_match['high'] & self.emotion_stability['medium']
+                      & self.liveness_score['medium'], self.auth_confidence['review']),
+
+            ctrl.Rule(self.face_match['low'], self.auth_confidence['reject']),
+
+            ctrl.Rule(self.liveness_score['low'], self.auth_confidence['reject']),
+
+            ctrl.Rule(self.emotion_stability['low'] & self.face_match['medium'],
+                      self.auth_confidence['reject'])
+        ]
+
+        self.control_system = ctrl.ControlSystem(rules)
+        self.simulator = ctrl.ControlSystemSimulation(self.control_system)
+
+    def evaluate(self, face_match, emotion_stability, liveness_score):
+        self.simulator.input['face_match'] = max(0, min(1, face_match))
+        self.simulator.input['emotion_stability'] = max(0, min(1, emotion_stability))
+        self.simulator.input['liveness_score'] = max(0, min(1, liveness_score))
+
+        try:
+            self.simulator.compute()
+            confidence = self.simulator.output['auth_confidence']
+
+            if confidence > 0.7:
+                decision = "accept"
+            elif confidence > 0.4:
+                decision = "review"
+            else:
+                decision = "reject"
+
+            return confidence, decision
+        
+        except Exception as e:
+            print(f"Fuzzy evaluation error: {e}")
+            return 0.0, "reject"
 
 class FaceAuthSystem:
     def __init__(self):
@@ -309,6 +396,7 @@ class FaceAuthSystem:
             self.face_db = FaceDatabase()
             self.face_processor = FaceProcessor()
             self.sentiment = SentimentAnalyzer()
+            self.fuzzy_system = IntervalType2FIS()
             self.known_encodings = []
             self.known_names = []
             self.known_user_ids = []
@@ -338,22 +426,29 @@ class FaceAuthSystem:
     def _train_feature_pipeline(self):
         try:
             pipeline = Pipeline([
-                ('feature_selection', SelectKBest(f_classif, k =100)),
-                ('dimensionality_reduction', PCA(n_components = 0.95))
+                ('feature_selection', SelectKBest(f_classif, k=150)),
+                ('dimensionality_reduction', PCA(n_components=min(50, len(self.known_encodings) - 1)))
             ])
 
+
             if len(self.known_encodings) > 1:
-                pipeline.fit(self.known_encodings, self.known_names)
+                print("Before reduction:", np.array(self.known_encodings).shape)
+                X = [np.array(enc).flatten() for enc in self.known_encodings]
+                reduced = pipeline.fit_transform(X, self.known_names)
+
+                print("After reduction:", reduced.shape)
+
                 self.feature_pipeline = pipeline
                 self.face_db.save_pipeline(pipeline)
                 logging.info("Feature reduction pipeline trained and saved.")
             else:
                 print("Atleast 2 users are needed to train the pipeline.")
+
         
         except Exception as e:
             logging.error(f"Error training feature pipeline: {e}")
 
-    def extract_hybrid_features(self, image):
+    def extract_hybrid_features(self, image, apply_pipeline=True):
         try:
             rgb_image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
             face_encodings = face_recognition.face_encodings(rgb_image)
@@ -368,13 +463,15 @@ class FaceAuthSystem:
             hog_feat = hog(resized, pixels_per_cell=(8, 8), cells_per_block=(2, 2), feature_vector=True)
             combined_feat = np.concatenate((deep_feat, hog_feat))
 
-            if self.feature_pipeline is not None:
-                combined_feat = self.feature_pipeline.transform([combined_feat])[0]
-            
-            return combined_feat
+            if apply_pipeline and self.feature_pipeline is not None:
+                combined_feat = self.feature_pipeline.transform([combined_feat])
+                return combined_feat[0]  # Return flattened reduced features
+
+            return combined_feat  # Raw features
         except Exception as e:
             logging.error(f"Error extracting hybrid features: {e}")
             return None
+
         
     def train_classifier(self):
         try:
@@ -383,11 +480,23 @@ class FaceAuthSystem:
                 print("No users in database to train classifier.")
                 return
 
-            X = [enc for _, _, enc in records]
+            print("Preparing classifier training data:")
+            X = []
+            y = []
+            for _, name, enc in records:
+                try:
+                    enc = np.array(enc).flatten()
+                    X.append(enc)
+                    y.append(name)
+                    print(f" - {name} ({len(enc)} features)")
+                except Exception as e:
+                    logging.error(f"Error processing encoding for {name}: {e}")
+
             if self.feature_pipeline is not None:
                 X = self.feature_pipeline.transform(X)
 
-            y = [name for _, name, _ in records]
+            print(f"Total samples: {len(X)} | Labels: {len(y)}")
+
 
             if len(set(y)) < 2:
                 print("At least two users are required to train the classifier.")
@@ -396,6 +505,7 @@ class FaceAuthSystem:
 
             encoder = LabelEncoder()
             y_encoded = encoder.fit_transform(y)
+            print("Label mapping:", dict(zip(encoder.classes_, encoder.transform(encoder.classes_))))
             clf = SVC(kernel="linear", probability=True)
             clf.fit(X, y_encoded)
             self.face_db.save_classifier(clf, encoder)
@@ -407,30 +517,151 @@ class FaceAuthSystem:
     def register_user(self):
         print("\n=== User Registration ===")
         name = input("Enter your name: ").strip()
-        user_id = input("Enter your id: ").strip()
+        user_id_input = input("Enter your ID: ").strip()
 
-        if not name or not user_id:
+        if not name or not user_id_input:
             print("Name and ID cannot be empty.")
             return
 
-        print("Please look at the camera.")
-        face_image = self.face_processor.capture_face()
-        if face_image is None:
-            print("Failed to capture a valid face image.")
+        # Try to add user only once
+        try:
+            cursor = self.face_db.conn.cursor()
+            cursor.execute("INSERT INTO users (name, user_id) VALUES (?, ?)", (name, user_id_input))
+            user_id = cursor.lastrowid
+            self.face_db.conn.commit()
+        except sqlite3.IntegrityError:
+            print("User ID already exists.")
+            logging.error(f"User ID {user_id_input} already exists")
+            return
+        except sqlite3.Error as e:
+            print("Database error.")
+            logging.error(f"User registration DB error: {e}")
             return
 
-        features = self.extract_hybrid_features(face_image)
-        if features is None:
-            print("No face detected in the image.")
+        print("Look at the camera. Capturing 5 face images...")
+
+        face_images = []
+        cap = cv.VideoCapture(0)
+        if not cap.isOpened():
+            print("Could not open camera.")
             return
 
-        if self.face_db.add_user(name, user_id, features):
-            print("Registration Successful!!")
-            self._load_known_faces()
-            self._train_feature_pipeline()
-            self.train_classifier()
-        else:
-            print("Registration failed")
+        count = 0
+        start_time = time.time()
+        while count < 5 and (time.time() - start_time) < 30:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            faces = self.face_processor.detector(gray)
+            if faces and self.face_processor.check_liveness(frame, faces[0]):
+                face_images.append(frame.copy())
+                count += 1
+                print(f"Captured image {count}/5")
+                time.sleep(1)
+
+        cap.release()
+
+        if len(face_images) < 5:
+            print("Failed to capture enough valid images.")
+            return
+
+        # Now insert encodings for the user
+        for img in face_images:
+            features = self.extract_hybrid_features(img, apply_pipeline = False)
+            if features is None:
+                print("Face not detected in one of the images.")
+                return
+
+            if isinstance(features, np.ndarray) and features.ndim > 1:
+                features = features.flatten()
+            else:
+                features = np.array(features).flatten()
+
+            encrypted_data = self.face_db.cipher.encrypt(features.tobytes())
+
+            encrypted_data = self.face_db.cipher.encrypt(features.tobytes())
+            try:
+                cursor.execute("INSERT INTO face_encodings (user_id, encrypted_data) VALUES (?, ?)", (user_id, encrypted_data))
+            except sqlite3.Error as e:
+                print("Error inserting face encoding.")
+                logging.error(f"Face encoding insert error: {e}")
+                return
+
+        self.face_db.conn.commit()
+        print("Captured and stored all samples successfully.")
+
+        self._load_known_faces()
+        self._train_feature_pipeline()
+        self.train_classifier()
+        print("Registration Successful!!")
+
+
+    def _calculate_emotion_stability(self, face_image):
+        frames = self.face_processor.capture_frames_over_time(5)
+        if not frames:
+            return 0.5
+        
+        emotions = []
+        for frame in frames:
+            result = self.sentiment.detector.top_emotion(frame)
+            if result:
+                emotions.append(result[0])
+
+        if not emotions:
+            return 0.5
+        
+        counter = Counter(emotions)
+        total = len(counter)
+        dominant_emotion, count = counter.most_common(1)[0]
+        consistency = count / total
+
+        if dominant_emotion in ["angry", "fear", "disgust"]:
+            consistency *= 0.7
+
+        return max(0, min(1, consistency))
+    
+    def _get_liveness_score(self, face_image):
+        gray = cv.cvtColor(face_image, cv.COLOR_BGR2GRAY)
+        faces = self.face_processor.detector(gray)
+
+        if not faces:
+            return 0.0
+        
+        face = faces[0]
+
+        try:
+            landmarks = self.face_processor.predictor(gray, face)
+
+            left_eye = self.face_processor._get_eye_points(landmarks, "left")
+            right_eye = self.face_processor._get_eye_points(landmarks, "right")
+            left_ear = self.face_processor._eye_aspect_ratio(left_eye)
+            right_ear = self.face_processor._eye_aspect_ratio(right_eye)
+
+            avg_ear = (left_ear + right_ear) / 2.0
+
+            ear_score = min(avg_ear / 0.3, 1.0)
+
+            mouth_points = [(landmarks.part(p).x, landmarks.part(p).y) 
+                             for p in range(48, 68) ]
+            mouth_ear = self._mouth_aspect_ratio(mouth_points)
+            mouth_score = max(0, min(1, 1 - (mouth_ear/0.5)))
+
+            liveness_score = (ear_score * 0.6 + mouth_score * 0.4)
+            return(max(0, min(1, liveness_score)))
+
+        except Exception as e:
+            logging.error(f"Liveness detection error: {e}")
+            return 0.5
+        
+
+    def _mouth_aspect_ratio(self, mouth_points):
+        A = dist.euclidean(mouth_points[2], mouth_points[10])
+        B = dist.euclidean(mouth_points[4], mouth_points[8])
+        C = dist.euclidean(mouth_points[0], mouth_points[6])
+
+        return (A + B) / (2.0 * C)
 
 
     def authentication(self):
@@ -452,42 +683,83 @@ class FaceAuthSystem:
             return
 
         try:
-            prediction = clf.predict([features])
-            name = encoder.inverse_transform(prediction)[0]
-        except Exception as e:
-            logging.error(f"Prediction error: {e}")
-            print("Authentication failed.")
-            return
+            probabilities = clf.predict_proba([features])
+            predicted_class = np.argmax(probabilities)
+            name = encoder.inverse_transform([predicted_class])[0]
 
-        try:
-            ip_address = socket.gethostbyname(socket.gethostname())
-        except:
-            ip_address = "127.0.0.1"
+            print(f"Predicted probabilities: {probabilities}")
+            print(f"Predicted class index: {np.argmax(probabilities)}")
+            print(f"Predicted label (name): {name}")
 
-        emotion_result = self.sentiment.detector.top_emotion(face_image)
-        emotion = emotion_result[0] if emotion_result else "unknown"
-        print(f"Detected emotion: {emotion}")
-
-        if emotion in ["angry", "fear", "disgust"]:
-            print("High stress detected. Secondary authentication required.")
-            otp = input("Enter OTP sent to your email: ")
-            if otp != "123456":
-                print("Authentication failed.")
-                self.face_db.log_access(
-                    user_id=self.name_to_user_id.get(name),
-                    success=False,
-                    ip_address=ip_address,
-                    emotion=emotion
-                )
+            max_prob = np.max(probabilities)
+            if max_prob < 0.55:
+                print("Prediction confidence too low. Aborting authentication.")
                 return
 
-        print(f"Welcome {name}")
-        user_id = self.name_to_user_id.get(name)
-        if user_id:
-            self.face_db.log_access(user_id, True, ip_address, emotion)
-        else:
-            print("User ID not found for authenticated name.")
-            logging.warning(f"No matching user ID for name: {name}")
+            
+
+            emotion_stability = self._calculate_emotion_stability(face_image)
+            liveness_score = self._get_liveness_score(face_image)
+
+            print(f"\nRaw Scores: ")
+            print(f"Face Match: {max_prob:.2f}")
+            print(f"Emotion Stability: {emotion_stability:.2f}")
+            print(f"Liveness Score: {liveness_score:.2f}")
+
+            confidence, decision = self.fuzzy_system.evaluate(
+                face_match = max_prob,
+                emotion_stability = emotion_stability,
+                liveness_score = liveness_score
+            )
+
+            print(f"\nAuthentication Confidence: {confidence:.2f}")
+            print(f"System Decision: {decision.upper()}")
+
+            try:
+                ip_address = socket.gethostbyname(socket.gethostname())
+            except:
+                ip_address = "127.0.0.1"
+
+            emotion_result = self.sentiment.detector.top_emotion(face_image)
+            emotion = emotion_result[0] if emotion_result else "unknown"
+            print(f"Detected emotion: {emotion}")
+
+            if decision == "reject":
+                print("Authentication Failed.")
+                self.face_db.log_access(
+                    user_id = self.name_to_user_id.get(name),
+                    success = False,
+                    ip_address = ip_address,
+                    emotion = emotion
+                )
+                return
+            
+            elif decision == "review":
+                print("Secondary authentication required due to medium confidence.")
+                otp = input("Enter OTP: ")
+                if otp != "123456":
+                    print("Authentication Failed.")
+                    self.face_db.log_access(
+                        user_id = self.name_to_user_id.get(name),
+                        success = False,
+                        ip_address = ip_address,
+                        emotion = emotion
+                    )
+                    return
+
+            print(f"Welcome {name}")
+            user_id = self.name_to_user_id.get(name)
+
+            if user_id:
+                self.face_db.log_access(user_id, True, ip_address, emotion)
+            else:
+                print("User ID not found for authenticated name.")
+                logging.warning(f"No matching user ID for name: {name}")
+
+        except Exception as e:
+            logging.error(f"Authentication error: {e}")
+            print("Authentication Failed")
+
 
 if __name__ == '__main__':
     try:
