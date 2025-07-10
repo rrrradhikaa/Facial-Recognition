@@ -29,9 +29,24 @@ os.makedirs("encryption_key", exist_ok=True)
 os.makedirs("logs", exist_ok=True)
 
 # Configure logging
-logging.basicConfig(filename="logs/system.log",
-                    level=logging.INFO,
-                    format="%(asctime)s - %(levelname)s - %(message)s")
+log_path = os.path.join(os.getcwd(), "logs", "system.log")
+
+# Remove any existing handlers
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+# Setup logging to file and console using handlers only
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(log_path),
+        logging.StreamHandler()
+    ]
+)
+
+# Test log
+logging.info("✅ Logging initialized to both file and console")
 
 class FaceDatabase:
     def __init__(self):
@@ -150,7 +165,7 @@ class FaceDatabase:
     def load_pipeline(self):
         try:
             if os.path.exists("database/feature_pipeline.pkl"):
-                return joblib.load("databse/feature_pipeline.pkl")
+                return joblib.load("database/feature_pipeline.pkl")
         except Exception as e:
             logging.error(f"Error loading feature pipeline: {e}")
         return None
@@ -389,6 +404,48 @@ class IntervalType2FIS:
         except Exception as e:
             print(f"Fuzzy evaluation error: {e}")
             return 0.0, "reject"
+        
+    def plot_membership_functions(self):
+        fig, (ax0, ax1, ax2, ax3) = plt.subplots(nrows = 4, figsize = (8,12))
+
+        for term in self.face_match.terms:
+            ax0.plot(self.face_match.universe, fuzz.interp_membership(
+                self.face_match.universe, 
+                self.face_match[term].mf, 
+                self.face_match.universe
+            ), label=term)
+        ax0.set_title('Face Match Confidence')
+        ax0.legend()
+
+        for term in self.emotion_stability.terms:
+            ax1.plot(self.emotion_stability.universe, fuzz.interp_membership(
+                self.emotion_stability.universe, 
+                self.emotion_stability[term].mf, 
+                self.emotion_stability.universe
+            ), label=term)
+        ax1.set_title('Emotion Stability')
+        ax1.legend()
+
+        for term in self.liveness_score.terms:
+            ax2.plot(self.liveness_score.universe, fuzz.interp_membership(
+                self.liveness_score.universe, 
+                self.liveness_score[term].mf, 
+                self.liveness_score.universe
+            ), label=term)
+        ax2.set_title('Liveness Score')
+        ax2.legend()
+
+        for term in self.auth_confidence.terms:
+            ax3.plot(self.auth_confidence.universe, fuzz.interp_membership(
+                self.auth_confidence.universe, 
+                self.auth_confidence[term].mf, 
+                self.auth_confidence.universe
+            ), label=term)
+        ax3.set_title('Authentication Confidence')
+        ax3.legend()
+        
+        plt.tight_layout()
+        plt.show()
 
 class FaceAuthSystem:
     def __init__(self):
@@ -523,7 +580,6 @@ class FaceAuthSystem:
             print("Name and ID cannot be empty.")
             return
 
-        # Try to add user only once
         try:
             cursor = self.face_db.conn.cursor()
             cursor.execute("INSERT INTO users (name, user_id) VALUES (?, ?)", (name, user_id_input))
@@ -563,26 +619,26 @@ class FaceAuthSystem:
 
         cap.release()
 
-        if len(face_images) < 5:
+        if len(face_images) < 2:
             print("Failed to capture enough valid images.")
             return
 
-        # Now insert encodings for the user
+        successful_encodings = []
         for img in face_images:
-            features = self.extract_hybrid_features(img, apply_pipeline = False)
-            if features is None:
-                print("Face not detected in one of the images.")
-                return
-
-            if isinstance(features, np.ndarray) and features.ndim > 1:
-                features = features.flatten()
-            else:
+            features = self.extract_hybrid_features(img, apply_pipeline=False)
+            if features is not None:
                 features = np.array(features).flatten()
+                successful_encodings.append(features)
+            else:
+                print("Warning: Face not detected in one of the captured images. Skipping it.")
 
-            encrypted_data = self.face_db.cipher.encrypt(features.tobytes())
+        if len(successful_encodings) < 2:
+            print("Insufficient valid face samples captured (minimum 2 required).")
+            return
 
-            encrypted_data = self.face_db.cipher.encrypt(features.tobytes())
+        for features in successful_encodings:
             try:
+                encrypted_data = self.face_db.cipher.encrypt(features.tobytes())
                 cursor.execute("INSERT INTO face_encodings (user_id, encrypted_data) VALUES (?, ?)", (user_id, encrypted_data))
             except sqlite3.Error as e:
                 print("Error inserting face encoding.")
@@ -596,6 +652,7 @@ class FaceAuthSystem:
         self._train_feature_pipeline()
         self.train_classifier()
         print("Registration Successful!!")
+
 
 
     def _calculate_emotion_stability(self, face_image):
@@ -692,7 +749,7 @@ class FaceAuthSystem:
             print(f"Predicted label (name): {name}")
 
             max_prob = np.max(probabilities)
-            if max_prob < 0.55:
+            if max_prob < 0.45:
                 print("Prediction confidence too low. Aborting authentication.")
                 return
 
@@ -770,7 +827,8 @@ if __name__ == '__main__':
             print("1. Register New User")
             print("2. Authenticate User")
             print("3. Analyze Emotions Over Time")
-            print("4. Exit")
+            print("4. Visualize Fuzzy Membership Functions")
+            print("5. Exit")
 
             choice = input("Select Option: ").strip()
 
@@ -784,6 +842,8 @@ if __name__ == '__main__':
                     frames = system.face_processor.capture_frames_over_time(60)
                     system.sentiment.analyze_emotion_trend(frames)
                 elif choice == "4":
+                    system.fuzzy_system.plot_membership_functions()
+                elif choice == "5":
                     break
                 else:
                     print("Invalid Choice.")
