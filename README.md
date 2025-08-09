@@ -8,8 +8,8 @@ Robust registration and authentication using hybrid facial features (deep + HOG)
 ## * Liveness Detection via Eye and Mouth Aspect Ratio (EAR/MAR)
 Prevents spoofing by detecting natural blink and mouth movements using facial landmarks.
 
-## * Hybrid Feature Extraction
-Combines face_recognition embeddings with HOG features for improved classifier accuracy.
+## * Deep Feature Extraction
+Extracts face_recognition embeddings for improved classifier accuracy.
 
 ## * Encrypted Storage of Facial Data
 Face encodings are encrypted using Fernet symmetric encryption before being stored in the database.
