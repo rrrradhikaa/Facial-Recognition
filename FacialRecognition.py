@@ -513,18 +513,18 @@ class FaceAuthSystem:
                 return None
             deep_feat = face_encodings[0]
 
-            gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
-            resized = cv.resize(gray, (128, 128))
-            resized = np.clip(resized, 0, 255).astype(np.uint8)
+            # gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+            # resized = cv.resize(gray, (128, 128))
+            # resized = np.clip(resized, 0, 255).astype(np.uint8)
 
-            hog_feat = hog(resized, pixels_per_cell=(8, 8), cells_per_block=(2, 2), feature_vector=True)
-            combined_feat = np.concatenate((deep_feat, hog_feat))
+            # hog_feat = hog(resized, pixels_per_cell=(8, 8), cells_per_block=(2, 2), feature_vector=True)
+            # combined_feat = np.concatenate((deep_feat, hog_feat))
 
             if apply_pipeline and self.feature_pipeline is not None:
-                combined_feat = self.feature_pipeline.transform([combined_feat])
-                return combined_feat[0]  # Return flattened reduced features
+                deep_feat = self.feature_pipeline.transform([deep_feat])
+                return deep_feat[0]  # Return flattened reduced features
 
-            return combined_feat  # Raw features
+            return deep_feat  # Raw features
         except Exception as e:
             logging.error(f"Error extracting hybrid features: {e}")
             return None
