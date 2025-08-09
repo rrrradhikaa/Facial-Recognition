@@ -106,7 +106,7 @@ class FaceRecognitionBenchmark:
         if valid_custom:
             self.loo_evaluation("YourSystem", *zip(*valid_custom))
 
-        self.evaluate_lbph(faces, labels)
+        #self.evaluate_lbph(faces, labels)
 
     def loo_evaluation(self, name, features, labels):
         correct = 0
