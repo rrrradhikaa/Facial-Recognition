@@ -505,20 +505,13 @@ class FaceAuthSystem:
         except Exception as e:
             logging.error(f"Error training feature pipeline: {e}")
 
-    def extract_hybrid_features(self, image, apply_pipeline=True):
+    def extract_features(self, image, apply_pipeline=True):
         try:
             rgb_image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
             face_encodings = face_recognition.face_encodings(rgb_image)
             if not face_encodings:
                 return None
             deep_feat = face_encodings[0]
-
-            # gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
-            # resized = cv.resize(gray, (128, 128))
-            # resized = np.clip(resized, 0, 255).astype(np.uint8)
-
-            # hog_feat = hog(resized, pixels_per_cell=(8, 8), cells_per_block=(2, 2), feature_vector=True)
-            # combined_feat = np.concatenate((deep_feat, hog_feat))
 
             if apply_pipeline and self.feature_pipeline is not None:
                 deep_feat = self.feature_pipeline.transform([deep_feat])
@@ -625,7 +618,7 @@ class FaceAuthSystem:
 
         successful_encodings = []
         for img in face_images:
-            features = self.extract_hybrid_features(img, apply_pipeline=False)
+            features = self.extract_features(img, apply_pipeline=False)
             if features is not None:
                 features = np.array(features).flatten()
                 successful_encodings.append(features)
@@ -729,7 +722,7 @@ class FaceAuthSystem:
             print("Liveness check failed.")
             return
 
-        features = self.extract_hybrid_features(face_image)
+        features = self.extract_features(face_image)
         if features is None:
             print("No face detected.")
             return
