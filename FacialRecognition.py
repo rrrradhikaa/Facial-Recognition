@@ -1,41 +1,42 @@
 import os
 import logging
 import sqlite3
-from cryptography.fernet import Fernet
-import numpy as np
-import dlib
-import cv2 as cv
+import joblib
 import time
-from scipy.spatial import distance as dist
-import face_recognition
 import socket
-from skimage.feature import hog
+
+from cryptography.fernet import Fernet
+from collections import Counter
+
+import numpy as np
+import cv2 as cv
+import dlib
+import face_recognition
+
+from scipy.spatial import distance as dist
+from fer import FER
+
+import matplotlib.pyplot as plt
+
 from sklearn.svm import SVC
 from sklearn.preprocessing import LabelEncoder
-import joblib
-from fer import FER
 from sklearn.linear_model import LinearRegression
-import matplotlib.pyplot as plt
-from collections import Counter
-from sklearn.decomposition import PCA
-from sklearn.feature_selection import SelectKBest, f_classif
-from sklearn.pipeline import Pipeline
+
 import skfuzzy as fuzz
 from skfuzzy import control as ctrl
 
-# Create necessary directories
+# ---------------------------
+# Setup directories & logging
+# ---------------------------
 os.makedirs("database", exist_ok=True)
 os.makedirs("encryption_key", exist_ok=True)
 os.makedirs("logs", exist_ok=True)
 
-# Configure logging
 log_path = os.path.join(os.getcwd(), "logs", "system.log")
 
-# Remove any existing handlers
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 
-# Setup logging to file and console using handlers only
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -45,12 +46,14 @@ logging.basicConfig(
     ]
 )
 
-# Test log
 logging.info("✅ Logging initialized to both file and console")
 
+# ---------------------------
+# FaceDatabase: encrypted storage, classifier/pipeline persistence
+# ---------------------------
 class FaceDatabase:
     def __init__(self):
-        self.conn = sqlite3.connect("database/face_recogniton.db")
+        self.conn = sqlite3.connect("database/face_recogniton.db", check_same_thread=False)
         self._init_db()
         self._init_encryption()
 
@@ -88,18 +91,27 @@ class FaceDatabase:
         with open(key_path, 'rb') as f:
             self.cipher = Fernet(f.read())
 
-    def add_user(self, name, user_id_input, face_encoding):
+    def add_user(self, name, user_id_input, face_encoding_arrays):
+        """
+        Add a user and multiple face encodings (list of 1D numpy arrays)
+        """
         try:
             cursor = self.conn.cursor()
-            cursor.execute('''INSERT INTO users (name, user_id) VALUES (?, ?)''', 
+            cursor.execute('''INSERT INTO users (name, user_id) VALUES (?, ?)''',
                           (name, user_id_input))
-            user_id = cursor.lastrowid
+            db_user_id = cursor.lastrowid
 
-            encrypted_data = self.cipher.encrypt(face_encoding.tobytes())
-            cursor.execute('''INSERT INTO face_encodings (user_id, encrypted_data) VALUES (?, ?)''',
-                         (user_id, encrypted_data))
+            for enc in face_encoding_arrays:
+                if isinstance(enc, np.ndarray):
+                    enc_bytes = enc.tobytes()
+                else:
+                    enc_bytes = np.array(enc).tobytes()
+                encrypted_data = self.cipher.encrypt(enc_bytes)
+                cursor.execute('''INSERT INTO face_encodings (user_id, encrypted_data) VALUES (?, ?)''',
+                               (db_user_id, encrypted_data))
 
             self.conn.commit()
+            logging.info(f"Added user {name} (user_id: {user_id_input}) with {len(face_encoding_arrays)} encodings")
             return True
         except sqlite3.IntegrityError:
             logging.error(f"User ID {user_id_input} already exists")
@@ -110,6 +122,10 @@ class FaceDatabase:
             return False
 
     def get_all_encodings(self):
+        """
+        Returns list of tuples: (user_id_str, name, numpy_array_encoding)
+        user_id_str corresponds to users.user_id column (a string identifier provided at registration)
+        """
         try:
             cursor = self.conn.cursor()
             cursor.execute('''SELECT u.user_id, u.name, fe.encrypted_data
@@ -117,8 +133,15 @@ class FaceDatabase:
                             JOIN face_encodings fe ON u.id = fe.user_id
                             ORDER BY fe.id ASC''')
 
-            return [(row[0], row[1], np.frombuffer(self.cipher.decrypt(row[2]), dtype=np.float64))
-                    for row in cursor.fetchall()]
+            rows = cursor.fetchall()
+            results = []
+            for row in rows:
+                user_id_str = row[0]
+                name = row[1]
+                enc_bytes = self.cipher.decrypt(row[2])
+                enc = np.frombuffer(enc_bytes, dtype=np.float64)
+                results.append((user_id_str, name, enc))
+            return results
         except sqlite3.Error as e:
             logging.error(f"Database Error in get_all_encodings: {e}")
             return []
@@ -143,6 +166,7 @@ class FaceDatabase:
         try:
             joblib.dump(clf, "database/classifier.pkl")
             joblib.dump(encoder, "database/label_encoder.pkl")
+            logging.info("Saved classifier and label encoder to database/")
         except Exception as e:
             logging.error(f"Error saving classifier: {e}")
 
@@ -151,31 +175,20 @@ class FaceDatabase:
             if os.path.exists("database/classifier.pkl") and os.path.exists("database/label_encoder.pkl"):
                 clf = joblib.load("database/classifier.pkl")
                 encoder = joblib.load("database/label_encoder.pkl")
+                logging.info("Loaded classifier and label encoder from database/")
                 return clf, encoder
         except Exception as e:
             logging.error(f"Error loading classifier: {e}")
         return None, None
-    
-    def save_pipeline(self, pipeline):
-        try:
-            joblib.dump(pipeline, "database/feature_pipeline.pkl")
-        except Exception as e:
-            logging.error(f"Error saving feature pipeline: {e}")
 
-    def load_pipeline(self):
-        try:
-            if os.path.exists("database/feature_pipeline.pkl"):
-                return joblib.load("database/feature_pipeline.pkl")
-        except Exception as e:
-            logging.error(f"Error loading feature pipeline: {e}")
-        return None
-
-
+# ---------------------------
+# FaceProcessor: capture & liveness
+# ---------------------------
 class FaceProcessor:
     def __init__(self):
         try:
             self.detector = dlib.get_frontal_face_detector()
-            
+            # adjust model path as needed (expects models/shape_predictor_68_face_landmarks.dat)
             model_path = os.path.join(os.path.dirname(__file__), "models", "shape_predictor_68_face_landmarks.dat")
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"Model file not found at {model_path}")
@@ -184,7 +197,7 @@ class FaceProcessor:
             logging.error(f"Error initializing FaceProcessor: {e}")
             raise
 
-    def capture_face(self):
+    def capture_face(self, timeout_sec=10):
         try:
             cap = cv.VideoCapture(0)
             if not cap.isOpened():
@@ -193,7 +206,7 @@ class FaceProcessor:
             start_time = time.time()
             captured_frame = None
 
-            while time.time() - start_time < 10:
+            while time.time() - start_time < timeout_sec:
                 ret, frame = cap.read()
                 if not ret:
                     continue
@@ -247,10 +260,63 @@ class FaceProcessor:
             right_ear = self._eye_aspect_ratio(right_eye)
 
             avg_ear = (left_ear + right_ear) / 2.0
-            return avg_ear > 0.25
+            return avg_ear > 0.20  # slightly relaxed threshold for blink detection
         except Exception as e:
             logging.error(f"Error in check_liveness: {e}")
             return False
+    
+    def temporal_liveness_check(self, duration_sec=3):
+        """Capture short sequence and verify blink/micro-movement patterns."""
+        cap = cv.VideoCapture(0)
+        if not cap.isOpened():
+            logging.error("Cannot open camera for temporal liveness.")
+            return 0.0
+
+        ear_series = []
+        start_time = time.time()
+
+        while time.time() - start_time < duration_sec:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            faces = self.detector(gray)
+            if faces:
+                face = faces[0]
+                landmarks = self.predictor(gray, face)
+                left_eye = self._get_eye_points(landmarks, "left")
+                right_eye = self._get_eye_points(landmarks, "right")
+                ear_series.append((self._eye_aspect_ratio(left_eye) + self._eye_aspect_ratio(right_eye)) / 2.0)
+            time.sleep(0.05)
+
+        cap.release()
+
+        if not ear_series:
+            return 0.0
+
+        blinks = sum(1 for i in range(1, len(ear_series)) if ear_series[i] < 0.20 < ear_series[i-1])
+        blink_score = min(blinks / 2.0, 1.0)
+        micro_variation = np.std(ear_series)
+        motion_score = min(micro_variation / 0.05, 1.0)
+
+        return 0.6 * blink_score + 0.4 * motion_score
+    
+    def _image_quality_score(self, image):
+        """Return a quality score between 0 and 1."""
+        import cv2 as cv
+        import numpy as np
+
+        gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+        sharpness = cv.Laplacian(gray, cv.CV_64F).var()
+        brightness = np.mean(gray)
+
+        # Normalize: sharpness (0-500+) and brightness (0-255)
+        sharpness_score = min(sharpness / 300.0, 1.0)
+        brightness_score = max(0, min(1, (brightness - 40) / 170.0))
+
+        return 0.6 * sharpness_score + 0.4 * brightness_score
+
+
 
     def _get_eye_points(self, landmarks, side):
         points = [36, 37, 38, 39, 40, 41] if side == "left" else [42, 43, 44, 45, 46, 47]
@@ -266,7 +332,9 @@ class FaceProcessor:
             logging.error(f"Error in _eye_aspect_ratio: {e}")
             return 0
 
-
+# ---------------------------
+# Sentiment (emotion) analysis
+# ---------------------------
 class SentimentAnalyzer:
     def __init__(self):
         try:
@@ -304,7 +372,7 @@ class SentimentAnalyzer:
         if not emotions:
             print("No emotions available for regression.")
             return
-        
+
         print("\n=== Linear Regression Results ===")
         x = np.arange(len(emotions)).reshape(-1, 1)
         for emotion_type in set(emotions):
@@ -326,13 +394,16 @@ class SentimentAnalyzer:
         except Exception as e:
             logging.error(f"Error plotting emotions: {e}")
 
-class IntervalType2FIS:
+# ---------------------------
+# Adaptive Fuzzy Inference System
+# ---------------------------
+class AdaptiveFIS:
     def __init__(self):
-        self.face_match = ctrl.Antecedent(np.arange(0, 1.01, 0.1), "face_match")
-        self.emotion_stability = ctrl.Antecedent(np.arange(0, 1.01, 0.1), "emotion_stability")
-        self.liveness_score = ctrl.Antecedent(np.arange(0, 1.01, 0.1), "liveness_score")
+        self.face_match = ctrl.Antecedent(np.arange(0, 1.01, 0.01), "face_match")
+        self.emotion_stability = ctrl.Antecedent(np.arange(0, 1.01, 0.01), "emotion_stability")
+        self.liveness_score = ctrl.Antecedent(np.arange(0, 1.01, 0.01), "liveness_score")
 
-        self.auth_confidence = ctrl.Consequent(np.arange(0, 1.1, 0.1), "auth_confidence")
+        self.auth_confidence = ctrl.Consequent(np.arange(0, 1.01, 0.01), "auth_confidence")
 
         self._setup_membership_function()
         self._setup_rules()
@@ -358,10 +429,9 @@ class IntervalType2FIS:
         rules = [
             ctrl.Rule(self.face_match['high'] & self.emotion_stability['high']
                       & self.liveness_score['high'], self.auth_confidence['accept']),
-            
+
             ctrl.Rule(self.face_match['high'] & self.emotion_stability['medium']
                       & self.liveness_score['high'], self.auth_confidence['accept']),
-
 
             ctrl.Rule(self.face_match['high'] & self.emotion_stability['low']
                       & self.liveness_score['high'], self.auth_confidence['review']),
@@ -384,13 +454,13 @@ class IntervalType2FIS:
         self.simulator = ctrl.ControlSystemSimulation(self.control_system)
 
     def evaluate(self, face_match, emotion_stability, liveness_score):
-        self.simulator.input['face_match'] = max(0, min(1, face_match))
-        self.simulator.input['emotion_stability'] = max(0, min(1, emotion_stability))
-        self.simulator.input['liveness_score'] = max(0, min(1, liveness_score))
+        self.simulator.input['face_match'] = max(0, min(1, float(face_match)))
+        self.simulator.input['emotion_stability'] = max(0, min(1, float(emotion_stability)))
+        self.simulator.input['liveness_score'] = max(0, min(1, float(liveness_score)))
 
         try:
             self.simulator.compute()
-            confidence = self.simulator.output['auth_confidence']
+            confidence = float(self.simulator.output['auth_confidence'])
 
             if confidence > 0.7:
                 decision = "accept"
@@ -400,18 +470,36 @@ class IntervalType2FIS:
                 decision = "reject"
 
             return confidence, decision
-        
+
         except Exception as e:
-            print(f"Fuzzy evaluation error: {e}")
+            logging.error(f"Fuzzy evaluation error: {e}")
             return 0.0, "reject"
         
+    def adapt_membership_functions(self, recent_results):
+        if not recent_results:
+            return
+        successful = [r for r in recent_results if r['decision'] == 'accept' and r.get('ground_truth') == True]
+        if not successful:
+            return
+
+        mean_face_match = np.mean([r['face_match'] for r in successful])
+        mean_emotion = np.mean([r['emotion_stability'] for r in successful])
+        mean_liveness = np.mean([r['liveness_score'] for r in successful])
+
+        self.face_match['high'] = fuzz.gaussmf(self.face_match.universe, mean_face_match, 0.1)
+        self.emotion_stability['high'] = fuzz.gaussmf(self.emotion_stability.universe, mean_emotion, 0.1)
+        self.liveness_score['high'] = fuzz.gaussmf(self.liveness_score.universe, mean_liveness, 0.1)
+
+        logging.info(f"Fuzzy sets adapted: FM={mean_face_match:.2f}, ES={mean_emotion:.2f}, LS={mean_liveness:.2f}")
+
+
     def plot_membership_functions(self):
-        fig, (ax0, ax1, ax2, ax3) = plt.subplots(nrows = 4, figsize = (8,12))
+        fig, (ax0, ax1, ax2, ax3) = plt.subplots(nrows=4, figsize=(8, 12))
 
         for term in self.face_match.terms:
             ax0.plot(self.face_match.universe, fuzz.interp_membership(
-                self.face_match.universe, 
-                self.face_match[term].mf, 
+                self.face_match.universe,
+                self.face_match[term].mf,
                 self.face_match.universe
             ), label=term)
         ax0.set_title('Face Match Confidence')
@@ -419,8 +507,8 @@ class IntervalType2FIS:
 
         for term in self.emotion_stability.terms:
             ax1.plot(self.emotion_stability.universe, fuzz.interp_membership(
-                self.emotion_stability.universe, 
-                self.emotion_stability[term].mf, 
+                self.emotion_stability.universe,
+                self.emotion_stability[term].mf,
                 self.emotion_stability.universe
             ), label=term)
         ax1.set_title('Emotion Stability')
@@ -428,8 +516,8 @@ class IntervalType2FIS:
 
         for term in self.liveness_score.terms:
             ax2.plot(self.liveness_score.universe, fuzz.interp_membership(
-                self.liveness_score.universe, 
-                self.liveness_score[term].mf, 
+                self.liveness_score.universe,
+                self.liveness_score[term].mf,
                 self.liveness_score.universe
             ), label=term)
         ax2.set_title('Liveness Score')
@@ -437,30 +525,34 @@ class IntervalType2FIS:
 
         for term in self.auth_confidence.terms:
             ax3.plot(self.auth_confidence.universe, fuzz.interp_membership(
-                self.auth_confidence.universe, 
-                self.auth_confidence[term].mf, 
+                self.auth_confidence.universe,
+                self.auth_confidence[term].mf,
                 self.auth_confidence.universe
             ), label=term)
         ax3.set_title('Authentication Confidence')
         ax3.legend()
-        
+
         plt.tight_layout()
         plt.show()
 
+# ---------------------------
+# High-level FaceAuthSystem (no feature reduction)
+# ---------------------------
 class FaceAuthSystem:
     def __init__(self):
         try:
             self.face_db = FaceDatabase()
             self.face_processor = FaceProcessor()
             self.sentiment = SentimentAnalyzer()
-            self.fuzzy_system = IntervalType2FIS()
+            self.fuzzy_system = AdaptiveFIS()
+
+            # Known face info loaded from DB (raw embeddings)
             self.known_encodings = []
             self.known_names = []
             self.known_user_ids = []
             self.name_to_user_id = {}
+
             self._load_known_faces()
-            self.feature_pipeline = None
-            self._load_feature_pipeline()
         except Exception as e:
             logging.error(f"Error initializing FaceAuthSystem: {e}")
             raise
@@ -472,65 +564,45 @@ class FaceAuthSystem:
             self.known_names = [name for _, name, _ in records]
             self.known_user_ids = [user_id for user_id, _, _ in records]
             self.name_to_user_id = {name: user_id for user_id, name, _ in records}
+            logging.info(f"Loaded {len(self.known_encodings)} known encodings for {len(set(self.known_names))} users")
         except Exception as e:
             logging.error(f"Error loading known faces: {e}")
 
-    def _load_feature_pipeline(self):
-        self.feature_pipeline = self.face_db.load_pipeline()
-        if self.feature_pipeline is None and self.known_encodings:
-            self._train_feature_pipeline()
-
-    def _train_feature_pipeline(self):
-        try:
-            pipeline = Pipeline([
-                ('feature_selection', SelectKBest(f_classif, k=150)),
-                ('dimensionality_reduction', PCA(n_components=min(50, len(self.known_encodings) - 1)))
-            ])
+    def _image_quality_score(self, image):
+        """Return a quality score between 0 and 1."""
+        gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+        sharpness = cv.Laplacian(gray, cv.CV_64F).var()
+        brightness = np.mean(gray)
+        # Normalize: sharpness (0-1000) and brightness (0-255)
+        sharpness_score = min(sharpness / 500.0, 1.0)
+        brightness_score = max(0, min(1, (brightness - 50) / 150.0))
+        return 0.6 * sharpness_score + 0.4 * brightness_score
 
 
-            if len(self.known_encodings) > 1:
-                print("Before reduction:", np.array(self.known_encodings).shape)
-                X = [np.array(enc).flatten() for enc in self.known_encodings]
-                reduced = pipeline.fit_transform(X, self.known_names)
-
-                print("After reduction:", reduced.shape)
-
-                self.feature_pipeline = pipeline
-                self.face_db.save_pipeline(pipeline)
-                logging.info("Feature reduction pipeline trained and saved.")
-            else:
-                print("Atleast 2 users are needed to train the pipeline.")
-
-        
-        except Exception as e:
-            logging.error(f"Error training feature pipeline: {e}")
-
-    def extract_features(self, image, apply_pipeline=True):
+    def extract_features(self, image):
+        quality = self.face_processor._image_quality_score(image)
+        if quality < 0.25:
+            logging.warning(f"Image quality too low ({quality:.2f}) — skipping encoding.")
+            return None
         try:
             rgb_image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
             face_encodings = face_recognition.face_encodings(rgb_image)
-            if not face_encodings:
-                return None
-            deep_feat = face_encodings[0]
-
-            if apply_pipeline and self.feature_pipeline is not None:
-                deep_feat = self.feature_pipeline.transform([deep_feat])
-                return deep_feat[0]  # Return flattened reduced features
-
-            return deep_feat  # Raw features
+            return face_encodings[0] if face_encodings else None
         except Exception as e:
-            logging.error(f"Error extracting hybrid features: {e}")
+            logging.error(f"Error extracting features: {e}")
             return None
 
-        
+
     def train_classifier(self):
+        """
+        Train an SVM classifier on the raw encodings (no feature reduction)
+        """
         try:
             records = self.face_db.get_all_encodings()
             if not records:
                 print("No users in database to train classifier.")
                 return
 
-            print("Preparing classifier training data:")
             X = []
             y = []
             for _, name, enc in records:
@@ -538,15 +610,14 @@ class FaceAuthSystem:
                     enc = np.array(enc).flatten()
                     X.append(enc)
                     y.append(name)
-                    print(f" - {name} ({len(enc)} features)")
                 except Exception as e:
                     logging.error(f"Error processing encoding for {name}: {e}")
 
-            if self.feature_pipeline is not None:
-                X = self.feature_pipeline.transform(X)
+            if not X:
+                print("No encodings available for training.")
+                return
 
             print(f"Total samples: {len(X)} | Labels: {len(y)}")
-
 
             if len(set(y)) < 2:
                 print("At least two users are required to train the classifier.")
@@ -555,10 +626,12 @@ class FaceAuthSystem:
 
             encoder = LabelEncoder()
             y_encoded = encoder.fit_transform(y)
-            print("Label mapping:", dict(zip(encoder.classes_, encoder.transform(encoder.classes_))))
+
             clf = SVC(kernel="linear", probability=True)
             clf.fit(X, y_encoded)
+
             self.face_db.save_classifier(clf, encoder)
+            logging.info("Classifier trained and saved.")
             print("Classifier trained successfully.")
         except Exception as e:
             logging.error(f"Error training classifier: {e}")
@@ -573,22 +646,8 @@ class FaceAuthSystem:
             print("Name and ID cannot be empty.")
             return
 
-        try:
-            cursor = self.face_db.conn.cursor()
-            cursor.execute("INSERT INTO users (name, user_id) VALUES (?, ?)", (name, user_id_input))
-            user_id = cursor.lastrowid
-            self.face_db.conn.commit()
-        except sqlite3.IntegrityError:
-            print("User ID already exists.")
-            logging.error(f"User ID {user_id_input} already exists")
-            return
-        except sqlite3.Error as e:
-            print("Database error.")
-            logging.error(f"User registration DB error: {e}")
-            return
-
-        print("Look at the camera. Capturing 5 face images...")
-
+        # Capture multiple samples
+        print("Look at the camera. Capturing 15 face images (may take ~20-30s)...")
         face_images = []
         cap = cv.VideoCapture(0)
         if not cap.isOpened():
@@ -597,7 +656,8 @@ class FaceAuthSystem:
 
         count = 0
         start_time = time.time()
-        while count < 5 and (time.time() - start_time) < 30:
+        target = 15
+        while count < target and (time.time() - start_time) < 60:
             ret, frame = cap.read()
             if not ret:
                 continue
@@ -607,8 +667,8 @@ class FaceAuthSystem:
             if faces and self.face_processor.check_liveness(frame, faces[0]):
                 face_images.append(frame.copy())
                 count += 1
-                print(f"Captured image {count}/5")
-                time.sleep(1)
+                print(f"Captured image {count}/{target}")
+                time.sleep(0.5)
 
         cap.release()
 
@@ -616,12 +676,12 @@ class FaceAuthSystem:
             print("Failed to capture enough valid images.")
             return
 
+        # Extract encodings
         successful_encodings = []
         for img in face_images:
-            features = self.extract_features(img, apply_pipeline=False)
+            features = self.extract_features(img)
             if features is not None:
-                features = np.array(features).flatten()
-                successful_encodings.append(features)
+                successful_encodings.append(np.array(features).flatten())
             else:
                 print("Warning: Face not detected in one of the captured images. Skipping it.")
 
@@ -629,30 +689,22 @@ class FaceAuthSystem:
             print("Insufficient valid face samples captured (minimum 2 required).")
             return
 
-        for features in successful_encodings:
-            try:
-                encrypted_data = self.face_db.cipher.encrypt(features.tobytes())
-                cursor.execute("INSERT INTO face_encodings (user_id, encrypted_data) VALUES (?, ?)", (user_id, encrypted_data))
-            except sqlite3.Error as e:
-                print("Error inserting face encoding.")
-                logging.error(f"Face encoding insert error: {e}")
-                return
-
-        self.face_db.conn.commit()
-        print("Captured and stored all samples successfully.")
+        # Add to DB using FaceDatabase
+        added = self.face_db.add_user(name, user_id_input, successful_encodings)
+        if not added:
+            print("Failed to add user to the database (maybe user_id exists).")
+            return
 
         self._load_known_faces()
-        self._train_feature_pipeline()
+        # Retrain classifier automatically
         self.train_classifier()
         print("Registration Successful!!")
-
-
 
     def _calculate_emotion_stability(self, face_image):
         frames = self.face_processor.capture_frames_over_time(5)
         if not frames:
             return 0.5
-        
+
         emotions = []
         for frame in frames:
             result = self.sentiment.detector.top_emotion(frame)
@@ -661,9 +713,9 @@ class FaceAuthSystem:
 
         if not emotions:
             return 0.5
-        
+
         counter = Counter(emotions)
-        total = len(counter)
+        total = sum(counter.values())
         dominant_emotion, count = counter.most_common(1)[0]
         consistency = count / total
 
@@ -671,14 +723,14 @@ class FaceAuthSystem:
             consistency *= 0.7
 
         return max(0, min(1, consistency))
-    
+
     def _get_liveness_score(self, face_image):
         gray = cv.cvtColor(face_image, cv.COLOR_BGR2GRAY)
         faces = self.face_processor.detector(gray)
 
         if not faces:
             return 0.0
-        
+
         face = faces[0]
 
         try:
@@ -690,21 +742,19 @@ class FaceAuthSystem:
             right_ear = self.face_processor._eye_aspect_ratio(right_eye)
 
             avg_ear = (left_ear + right_ear) / 2.0
-
             ear_score = min(avg_ear / 0.3, 1.0)
 
-            mouth_points = [(landmarks.part(p).x, landmarks.part(p).y) 
-                             for p in range(48, 68) ]
+            mouth_points = [(landmarks.part(p).x, landmarks.part(p).y)
+                             for p in range(48, 68)]
             mouth_ear = self._mouth_aspect_ratio(mouth_points)
-            mouth_score = max(0, min(1, 1 - (mouth_ear/0.5)))
+            mouth_score = max(0, min(1, 1 - (mouth_ear / 0.5)))
 
             liveness_score = (ear_score * 0.6 + mouth_score * 0.4)
-            return(max(0, min(1, liveness_score)))
+            return max(0, min(1, liveness_score))
 
         except Exception as e:
             logging.error(f"Liveness detection error: {e}")
             return 0.5
-        
 
     def _mouth_aspect_ratio(self, mouth_points):
         A = dist.euclidean(mouth_points[2], mouth_points[10])
@@ -713,18 +763,17 @@ class FaceAuthSystem:
 
         return (A + B) / (2.0 * C)
 
-
     def authentication(self):
         print("\n=== Authentication ===")
 
         face_image = self.face_processor.capture_face()
         if face_image is None:
-            print("Liveness check failed.")
+            print("Liveness check failed or no face captured.")
             return
 
         features = self.extract_features(face_image)
         if features is None:
-            print("No face detected.")
+            print("No face encoding detected.")
             return
 
         clf, encoder = self.face_db.load_classifier()
@@ -733,23 +782,31 @@ class FaceAuthSystem:
             return
 
         try:
-            probabilities = clf.predict_proba([features])
+            features_arr = np.array(features).flatten().reshape(1, -1)
+            logging.info(f"Authentication: feature shape {features_arr.shape}")
+
+            probabilities = clf.predict_proba(features_arr)
             predicted_class = np.argmax(probabilities)
             name = encoder.inverse_transform([predicted_class])[0]
 
             print(f"Predicted probabilities: {probabilities}")
-            print(f"Predicted class index: {np.argmax(probabilities)}")
+            print(f"Predicted class index: {predicted_class}")
             print(f"Predicted label (name): {name}")
 
-            max_prob = np.max(probabilities)
-            if max_prob < 0.45:
+            max_prob = float(np.max(probabilities))
+            # debug log for classifier calibration
+            logging.info(f"Max predicted probability: {max_prob:.4f}")
+
+            if max_prob < 0.35:  # slightly lowered threshold for initial testing
                 print("Prediction confidence too low. Aborting authentication.")
                 return
 
-            
-
             emotion_stability = self._calculate_emotion_stability(face_image)
             liveness_score = self._get_liveness_score(face_image)
+
+            temporal_liveness = self.face_processor.temporal_liveness_check(3)
+            liveness_score = (liveness_score + temporal_liveness) / 2.0
+
 
             print(f"\nRaw Scores: ")
             print(f"Face Match: {max_prob:.2f}")
@@ -757,9 +814,9 @@ class FaceAuthSystem:
             print(f"Liveness Score: {liveness_score:.2f}")
 
             confidence, decision = self.fuzzy_system.evaluate(
-                face_match = max_prob,
-                emotion_stability = emotion_stability,
-                liveness_score = liveness_score
+                face_match=max_prob,
+                emotion_stability=emotion_stability,
+                liveness_score=liveness_score
             )
 
             print(f"\nAuthentication Confidence: {confidence:.2f}")
@@ -777,23 +834,23 @@ class FaceAuthSystem:
             if decision == "reject":
                 print("Authentication Failed.")
                 self.face_db.log_access(
-                    user_id = self.name_to_user_id.get(name),
-                    success = False,
-                    ip_address = ip_address,
-                    emotion = emotion
+                    user_id=self.name_to_user_id.get(name),
+                    success=False,
+                    ip_address=ip_address,
+                    emotion=emotion
                 )
                 return
-            
+
             elif decision == "review":
                 print("Secondary authentication required due to medium confidence.")
                 otp = input("Enter OTP: ")
                 if otp != "123456":
                     print("Authentication Failed.")
                     self.face_db.log_access(
-                        user_id = self.name_to_user_id.get(name),
-                        success = False,
-                        ip_address = ip_address,
-                        emotion = emotion
+                        user_id=self.name_to_user_id.get(name),
+                        success=False,
+                        ip_address=ip_address,
+                        emotion=emotion
                     )
                     return
 
@@ -810,7 +867,9 @@ class FaceAuthSystem:
             logging.error(f"Authentication error: {e}")
             print("Authentication Failed")
 
-
+# ---------------------------
+# CLI main
+# ---------------------------
 if __name__ == '__main__':
     try:
         system = FaceAuthSystem()
@@ -821,7 +880,8 @@ if __name__ == '__main__':
             print("2. Authenticate User")
             print("3. Analyze Emotions Over Time")
             print("4. Visualize Fuzzy Membership Functions")
-            print("5. Exit")
+            print("5. Train Classifier (manual)")
+            print("6. Exit")
 
             choice = input("Select Option: ").strip()
 
@@ -837,6 +897,8 @@ if __name__ == '__main__':
                 elif choice == "4":
                     system.fuzzy_system.plot_membership_functions()
                 elif choice == "5":
+                    system.train_classifier()
+                elif choice == "6":
                     break
                 else:
                     print("Invalid Choice.")
