@@ -1,9 +1,9 @@
 # Facial Recognition-based Authentication System
-This is a Python-based facial authentication system with encryption and liveness detection. It allows users to register and authenticate using their face, while storing their data securely with encrypted encodings.
+This is a Python-based facial authentication system with Sentiment Analysis and Adaptive Fuzzy Inference. It allows users to register and authenticate using their face, while storing their data securely with encrypted encodings.
 
 # Features
 ## * Face-Based User Registration & Authentication
-Robust registration and authentication using hybrid facial features (deep + HOG).
+Robust registration and authentication using deep facial features.
 
 ## * Liveness Detection via Eye and Mouth Aspect Ratio (EAR/MAR)
 Prevents spoofing by detecting natural blink and mouth movements using facial landmarks.
@@ -30,7 +30,7 @@ Supports real-time frame capture for both registration and authentication with u
 Logs all major events including registration attempts, authentication decisions, and system errors.
 
 ## * Classifier & Feature Pipeline Persistence
-Saves and loads trained classifier (SVM) and feature reduction pipeline (PCA + SelectKBest) for reuse.
+Saves and loads trained classifier (SVM) for reuse.
 
 ## * Multiple User Support
 Supports registration and authentication of multiple unique users with per-user data handling.
@@ -90,13 +90,13 @@ python FacialRecognition.py
 
 * Performing liveness detection (blink/mouth movement) on each capture.
 
-* Extracting hybrid facial features (deep + HOG).
+* Extracting deep facial features.
 
 * Encrypting each face encoding using Fernet encryption.
 
 * Storing encrypted encodings along with user metadata (name, ID) in a local SQLite3 database.
 
-* Retraining and persisting the feature reduction pipeline and SVM classifier for recognition.
+* Retraining and persisting the SVM classifier for recognition.
 
 ## * authentication()
 * Performs secure user login by:
@@ -105,7 +105,7 @@ python FacialRecognition.py
 
 * Verifying liveness using eye and mouth aspect ratio.
 
-* Extracting hybrid facial features and passing them through the trained feature pipeline.
+* Extracting deep facial features and passing them through the trained feature pipeline.
 
 * Using the SVM classifier to predict user identity and associated probability.
 
